@@ -9,7 +9,11 @@ from typing import Tuple, Union, Optional
 # Import necessary NeuralForecast components
 from neuralforecast.auto import AutoNHITS, AutoNBEATS
 from neuralforecast.core import NeuralForecast
-from neuralforecast.losses.pytorch import MSE
+from neuralforecast.losses.pytorch import MSE,BasePointLoss
+from torch_dct import dct
+from torch import nn
+import torch
+from neuralforecast.losses.pytorch import BasePointLoss, _divide_no_nan, _weighted_mean 
 
 # Assume PSLoss_GDW and GDWLossMixin are importable
 # These would typically reside in appropriate modules within the library
@@ -24,7 +28,7 @@ from neuralforecast.losses.pytorch import MSE
 # ==============================================================================
 # Attempt to import the real classes if they exist in the environment
 from util_testing.patchwise_structural import PSLoss_GDW
-from util_testing._patchstruct_mixin import GDWLossMixin # Hypothetical location
+from util_testing._patchstruct_mixin import GDWLossMixin, AutoNBEATS_GDW, AutoNHITS_GDW # Hypothetical location
 # except ImportError as e:
 #     print(e)
 #     print("Warning: PSLoss_GDW or GDWLossMixin not found in standard paths. Using placeholder definitions.")
@@ -76,7 +80,7 @@ from util_testing._patchstruct_mixin import GDWLossMixin # Hypothetical location
 import argparse
 # Assuming glucose_experiment_configs.py is in the same directory or accessible
 try:
-    from glucose_experiment_configs import config_nbeats, config_nhits, init_optuna
+    from glucose_experiment_configs import config_nbeats, config_nhits, init_optuna, config_nbeats_lossweight, config_nbeats_gdw
 except ImportError:
     print("Warning: glucose_experiment_configs.py not found. Using default configs.")
     # Define dummy configs if import fails
@@ -89,32 +93,48 @@ from utilsforecast.plotting import plot_series
 # ==============================================================================
 # 1. Define Wrapper Classes for Auto Models using the Mixin
 # ==============================================================================
-class AutoNHITS_GDW(GDWLossMixin, AutoNHITS):
-    """ AutoNHITS with PSLoss_GDW support via GDWLossMixin. """
-    def __init__(self, **kwargs):
-        # Ensure the loss is PSLoss_GDW if provided, otherwise default might break mixin
-        if 'loss' in kwargs and not isinstance(kwargs['loss'], PSLoss_GDW):
-             print(f"Warning: Initializing AutoNHITS_GDW with loss type {type(kwargs['loss'])}. "
-                   f"GDW backward step will only work if loss is PSLoss_GDW.")
-        elif 'loss' not in kwargs:
-             raise ValueError("AutoNHITS_GDW requires a PSLoss_GDW instance during initialization.")
-        super().__init__(**kwargs)
-
-
-class AutoNBEATS_GDW(GDWLossMixin, AutoNBEATS):
-    """ AutoNBEATS with PSLoss_GDW support via GDWLossMixin. """
-    def __init__(self, **kwargs):
-        if 'loss' in kwargs and not isinstance(kwargs['loss'], PSLoss_GDW):
-             print(f"Warning: Initializing AutoNBEATS_GDW with loss type {type(kwargs['loss'])}. "
-                   f"GDW backward step will only work if loss is PSLoss_GDW.")
-        elif 'loss' not in kwargs:
-             raise ValueError("AutoNBEATS_GDW requires a PSLoss_GDW instance during initialization.")
-        super().__init__(**kwargs)
-
 # ==============================================================================
 # 2. Main Script Logic (Modified from previous version)
 # ==============================================================================
+class MAEDCT(BasePointLoss):
+    """Mean Absolute Error.
 
+    Calculates Mean Absolute Error between `y` and `y_hat`. MAE measures the relative prediction
+    accuracy of a forecasting method by calculating the deviation of the prediction and the true
+    value at a given time and averages these devations over the length of the series.
+
+    $$ \mathrm{MAE}(\\mathbf{y}_{\\tau}, \\mathbf{\hat{y}}_{\\tau}) = \\frac{1}{H} \\sum^{t+H}_{\\tau=t+1} |y_{\\tau} - \hat{y}_{\\tau}| $$
+
+    Args:
+        horizon_weight (Optional[torch.Tensor]): Tensor of size h, weight for each timestamp of the forecasting window. Defaults to None.
+    """
+
+    def __init__(self, horizon_weight=None):
+        super(MAEDCT, self).__init__(
+            horizon_weight=horizon_weight, outputsize_multiplier=1, output_names=[""]
+        )
+
+    def __call__(
+        self,
+        y: torch.Tensor,
+        y_hat: torch.Tensor,
+        mask: Union[torch.Tensor, None] = None,
+        y_insample: Union[torch.Tensor, None] = None,
+    ) -> torch.Tensor:
+        """Calculate Mean Absolute Error between actual and predicted values.
+
+        Args:
+            y (torch.Tensor): Actual values.
+            y_hat (torch.Tensor): Predicted values.
+            mask (Union[torch.Tensor, None], optional): Specifies datapoints to consider in loss. Defaults to None.
+            y_insample (Union[torch.Tensor, None], optional): Actual insample values. Defaults to None.
+
+        Returns:
+            torch.Tensor: MAE (single value).
+        """
+        losses = torch.abs(y - y_hat)+torch.abs(dct(y)-dct(y_hat))
+        weights = self._compute_weights(y=y, mask=mask)
+        return _weighted_mean(losses=losses, weights=weights)
 def main():
     args = parse_args()
     print("Starting main function with PS Loss comparison")
@@ -156,10 +176,9 @@ def main():
     ps_loss_instance = PSLoss_GDW(lambda_ps=3.0, delta_patch=36)
 
     models = [
-        AutoNHITS(h=FORECAST_HORIZON, backend="optuna", config=config_nhits, loss=MSE()), # Original NHITS with MSE
         AutoNBEATS(h=FORECAST_HORIZON, backend="optuna", config=config_nbeats, loss=MSE()),# Original NBEATS with MSE
-        AutoNHITS_GDW(h=FORECAST_HORIZON, backend="optuna", config=config_nhits, loss=ps_loss_instance), # NHITS with PS Loss
-        AutoNBEATS_GDW(h=FORECAST_HORIZON, backend="optuna", config=config_nbeats, loss=ps_loss_instance) # NBEATS with PS Loss
+        AutoNBEATS(h=FORECAST_HORIZON, backend="optuna", config=config_nbeats, loss=MAEDCT()), # NBEATS with PS Loss
+        AutoNBEATS_GDW(h=FORECAST_HORIZON, backend="optuna", config=config_nbeats_gdw, loss=ps_loss_instance)
     ]
 
     # --- Initialize NeuralForecast ---
@@ -205,7 +224,7 @@ def main():
             else:
                 print(f"Warning: Model '{model_name}' not found in cross-validation results.")
                 metrics[model_name] = np.nan
-    cross_validation_df.to_csv("results_patchloss.csv")
+    cross_validation_df.to_csv("results_patchloss_new-2.csv")
     # --- Plotting ---
     if not cross_validation_df.empty:
         print("\nPlotting results from the first CV window...")
@@ -245,7 +264,7 @@ def plot_cv_results(original_df, forecast_df, plot_input_size):
     ax.set_ylabel('Glucose Level')
     plt.legend()
     plt.tight_layout()
-    plt.savefig('./forecast_cv_plot.png')
+    plt.savefig('./forecast_cv_plot_new-2.png')
     # plt.show()
 
 
@@ -263,4 +282,3 @@ def parse_args():
 if __name__ == "__main__":
     print("Cuda available: {}".format(torch.cuda.is_available()))
     main()
-
